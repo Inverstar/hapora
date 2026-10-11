@@ -23,3 +23,9 @@ Thumbs.db
 
 # 本地配置
 .env
+
+# 诊断日志（pnpm hack --verbose 在失败时生成）
+hapora-debug.log
+
+# WorkBuddy 工作区数据
+.workbuddy-ai/

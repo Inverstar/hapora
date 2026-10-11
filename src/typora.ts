@@ -50,3 +50,6 @@ export const clearLicense = (): void => platform().clearLicense();
 
 export const probeActivation = (install: TyporaInstall, launchedAtMs: number): { state: ProbeState; detail: string } =>
   platform().probeActivation(install, launchedAtMs);
+
+/** 诊断用：本平台的验收信号文件（可选能力；不支持时返回 null）。 */
+export const logPath = (install: TyporaInstall): string | null => platform().logPath?.(install) ?? null;

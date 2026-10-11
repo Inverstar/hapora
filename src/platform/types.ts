@@ -136,6 +136,12 @@ export interface Platform {
    * settle 窗口才算数）；macOS 读许可证记录文件是否仍带激活键 + 进程是否存活。
    */
   probeActivation(install: TyporaInstall, launchedAtMs: number): { state: ProbeState; detail: string };
+
+  /**
+   * 诊断用：本平台的「验收信号文件」（Windows/Linux 为 typora.log，macOS 为许可证记录文件）。
+   * 仅 `--verbose` 失败时读取其末尾片段，可选。
+   */
+  logPath?(install: TyporaInstall): string | null;
 }
 
 /**

@@ -43,22 +43,32 @@ function templatePath(): string {
   return join(dirname(fileURLToPath(import.meta.url)), "inject", "patch.js");
 }
 
+/**
+ * 读补丁模板：行尾归一成 LF，并去掉末尾换行。
+ *
+ * 两条都是为了「注入 → 剥离」严格互逆（`stripPatch(inject(x)) === x`）：
+ *   - 仓库在 Windows 上签出时是 CRLF（core.autocrlf），不归一化则注入内容随宿主平台变化；
+ *   - 模板末尾若自带换行，剥离时会在原文前面留下一个多余的空行 —— 那意味着
+ *     「用剥离结果重建的原始入口」比随包发布的多一个字节，自校验基准就跟着错位。
+ */
 export function loadTemplate(): string {
-  const source = readFileSync(templatePath(), "utf-8");
+  const source = readFileSync(templatePath(), "utf-8").replace(/\r\n/g, "\n").replace(/\n+$/, "");
   for (const slot of Object.values(SLOT)) {
     if (!source.includes(slot)) throw new Error(`补丁模板缺少占位符 ${slot}`);
   }
   return source;
 }
 
-/** 从（可能已打过补丁的）入口源码中剥出原始内容 */
+/** 从（可能已打过补丁的）入口源码中剥出原始内容（容忍 CRLF 行尾） */
 export function stripPatch(source: string): string {
   const begin = source.indexOf(PATCH_BEGIN);
   if (begin < 0) return source;
   const end = source.indexOf(PATCH_END);
   if (end < 0) return source;
   const after = end + PATCH_END.length;
-  return source.slice(0, begin) + source.slice(source[after] === "\n" ? after + 1 : after);
+  const rest = source.slice(after);
+  const skip = rest.startsWith("\r\n") ? 2 : rest.startsWith("\n") ? 1 : 0;
+  return source.slice(0, begin) + source.slice(after + skip);
 }
 
 export function isPatched(source: string): boolean {

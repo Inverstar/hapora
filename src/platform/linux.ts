@@ -49,7 +49,15 @@ const HOME = homedir();
 /** 许可证数据目录：Electron userData 在 Linux 上默认 ~/.config/<app> */
 const LICENSE_DIR = join(HOME, ".config", "Typora");
 
-/** 许可证文件名指纹：Base64(SHA256(machineId + "typora"))[0..10]，[/=+-]→"a"（同 Windows 公式） */
+/**
+ * 许可证文件名指纹：Base64(SHA256(machineId + "typora"))[0..10]，[/=+-]→"a"（同 Windows 公式）。
+ * 纯函数单独导出：末尾那次替换漏掉会在约一半的机器上静默失效（文件名对不上 ⇒ 恒 no info）。
+ */
+export function fingerprintFor(machineId: string): string {
+  return createHash("sha256").update(machineId + "typora").digest("base64")
+    .substring(0, 10).replace(/[/=+-]/g, "a");
+}
+
 function linuxFingerprint(): string {
   let mid = "";
   try {
@@ -64,8 +72,7 @@ function linuxFingerprint(): string {
       /* 读取失败 */
     }
   }
-  return createHash("sha256").update(mid + "typora").digest("base64")
-    .substring(0, 10).replace(/[/=+-]/g, "a");
+  return fingerprintFor(mid);
 }
 
 let licensePathCache: string | null = null;
@@ -77,15 +84,23 @@ function licensePath(): string {
   return licensePathCache;
 }
 
+/** 解出许可证文件的载荷：整段内容是 JSON 的**十六进制编码**（同 profile.data）。 */
+export function decodeLicenseFile(hex: string): Record<string, string> {
+  return JSON.parse(Buffer.from(hex.trim(), "hex").toString("utf-8")) as Record<string, string>;
+}
+
+/** 编回许可证文件的内容：整段 JSON 的十六进制编码——**不是**裸 JSON（写成裸 JSON 时读不出）。 */
+export function encodeLicenseFile(data: Record<string, string>): string {
+  return Buffer.from(JSON.stringify(data), "utf-8").toString("hex");
+}
+
 /**
  * 读许可证文件。Typora 在 Linux 上把整个 JSON 存成**十六进制编码**（同 profile.data），
  * 即文件内容是 `Buffer.from(json).toString("hex")`，读取时先解 hex 再 JSON.parse。
  */
 function licenseRead(): { sl: string | null } {
   try {
-    const hex = readFileSync(licensePath(), "utf-8").trim();
-    const json = Buffer.from(hex, "hex").toString("utf-8");
-    const data = JSON.parse(json) as Record<string, string>;
+    const data = decodeLicenseFile(readFileSync(licensePath(), "utf-8"));
     return { sl: data["SLicense"] ?? null };
   } catch {
     return { sl: null };
@@ -96,14 +111,13 @@ function licenseWriteSLicense(value: string): void {
   mkdirSync(LICENSE_DIR, { recursive: true });
   let data: Record<string, string> = {};
   try {
-    const hex = readFileSync(licensePath(), "utf-8").trim();
-    data = JSON.parse(Buffer.from(hex, "hex").toString("utf-8")) as Record<string, string>;
+    data = decodeLicenseFile(readFileSync(licensePath(), "utf-8"));
   } catch {
     /* 文件不存在或格式错误，重置为空 */
   }
   data["SLicense"] = value;
   // 写回十六进制编码（与 Typora 自己的存储格式一致，否则启动时读不出来）
-  writeFileSync(licensePath(), Buffer.from(JSON.stringify(data), "utf-8").toString("hex"), "utf-8");
+  writeFileSync(licensePath(), encodeLicenseFile(data), "utf-8");
 }
 
 /** 验收 settle 窗口：自校验在启动约 1s 后触发，hasL 必须活过这个窗口才算数 */
@@ -182,6 +196,9 @@ const spec: UnixSpec = {
       licenseWriteSLicense("");
     },
   },
+
+  /** 诊断用：验收信号文件（--verbose 失败时取其末尾片段）。 */
+  logPath: () => join(HOME, ".config", "Typora", "typora.log"),
 
   probeActivation(_install, launchedAtMs) {
     const START_MARKER = "------------------start------------------";

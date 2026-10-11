@@ -11,7 +11,10 @@
  *   4. 写入许可证（Windows 为注册表 SLicense / IDate；Linux 为 ~/.config/Typora/<指纹> 的 hex 编码文件；
  *      macOS 为加密记录文件，lastTry 金丝雀落在续期窗口之外——记录存活本身即证明补丁生效）
  *   5. 启动 Typora 验收（Windows/Linux 读 typora.log 关键字；macOS 轮询记录状态与进程存活）；
- *      验收失败且可归因时自动回滚
+ *      失败且可归因时自动回滚
+ *
+ * 「落盘之后」是一段事务：写许可证失败、验收判 fatal、或任何一步抛错，都回滚到原始状态。
+ * 绝不留「补丁已生效、许可证缺失」这类无报错的半成品（见 docs/OPTIMIZATION.md P1-1）。
  *
  * 不对 Typora 版本、入口文件名、字节码文件名、安装位置、补丁偏移做任何硬编码假设。
  * 平台差异全部收敛在 src/platform/，本文件只做编排（按能力位分支，不按平台名）。
@@ -22,16 +25,20 @@
  *   --restore    从备份回滚
  *   --status     只打印当前状态
  *   --yes, -y    跳过确认（Typora 正在运行时）
+ *   --verbose    收集诊断信息，失败时写到仓库内 hapora-debug.log（默认不写）
  */
 
-import { existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, rmSync } from "node:fs";
 import { basename, join } from "node:path";
 import { tmpdir } from "node:os";
 
-import { pack, readEntry, readMain, unpack } from "./asar.js";
+import { readEntry, readMain } from "./asar.js";
+import { stageAsarPatch } from "./asar-stage.js";
 import * as tp from "./typora.js";
 import { loadConfig, LICENSE_SHAPE, repoRoot, type Config } from "./config.js";
-import { inject, isPatched, stripPatch, loadTemplate } from "./patch.js";
+import { isPatched, loadTemplate } from "./patch.js";
+import { planAsarBackup, planRecordBackup, type AsarBackupState } from "./backup.js";
+import { diag, diagTail, flushDiagnostics, setVerbose } from "./diag.js";
 
 const argv = process.argv.slice(2);
 const has = (...names: string[]) => names.some((n) => argv.includes(n));
@@ -53,31 +60,6 @@ const bad = (msg: string) => console.log(`  ✗ ${msg}`);
 /** 改写对象的措辞：asar 路线是 app.asar，Mach-O 路线是 Typora 二进制 */
 const TARGET_LABEL = tp.asarPatchSupported() ? "app.asar" : "Typora 二进制";
 
-/**
- * [asar 路线] 判断备份该怎么处理（只看状态，不落盘——真正的写入统一在 installFiles 里做）：
- *   - 没有备份      → 建一份
- *   - 备份已过期    → 刷新（当前 asar 的入口与备份记录的不一致 ⇒ 被重装/升级过）
- *   - 当前已被改过  → 保留旧备份（它才是原始内容的来源）
- */
-function planAsarBackup(install: tp.TyporaInstall): "created" | "refreshed" | "kept" {
-  if (!existsSync(install.backup)) return "created";
-  const backedEntry = readMain(install.backup);
-  const currentEntry = readMain(install.target);
-  const current = readEntry(install.target, currentEntry);
-  if (currentEntry !== backedEntry || (!isPatched(current) && current !== readEntry(install.backup, backedEntry))) {
-    return "refreshed";
-  }
-  return "kept";
-}
-
-/**
- * [记录路线] macOS 的备份规划：备份对象是许可证记录文件（随用户数据走，与 Typora 版本无关），
- * 因此只有「首次创建」与「沿用已有备份」两种状态——已有备份永远指向最早的原始记录。
- */
-function planRecordBackup(install: tp.TyporaInstall): "created" | "kept" {
-  return existsSync(install.backup) ? "kept" : "created";
-}
-
 function printStatus(install: tp.TyporaInstall, config: Config): void {
   say("当前状态");
   say(`  安装目录    ${install.dir}`);
@@ -90,7 +72,9 @@ function printStatus(install: tp.TyporaInstall, config: Config): void {
       say(`  入口文件    ${entry}  ${patched ? "（已注入补丁）" : "（原始）"}`);
       if (existsSync(install.backup)) {
         const backedEntry = readMain(install.backup);
+        const backedPatched = isPatched(readEntry(install.backup, backedEntry));
         if (backedEntry !== entry) say(`  ! 备份记录的是另一个入口：${backedEntry}（下次 hack 会刷新备份）`);
+        else if (backedPatched) say("  ! 备份里存的是已补丁版本（下次 hack 会用剥离后的原始内容刷新）");
       }
     } catch (err) {
       say(`  入口文件    读取失败：${(err as Error).message}`);
@@ -117,6 +101,25 @@ function printStatus(install: tp.TyporaInstall, config: Config): void {
   say(`  邮箱        ${config.email}`);
   say(`  序列号      ${config.licenseCode}`);
   say();
+}
+
+/**
+ * 把被改对象从备份拷回并清许可证。
+ * 二进制（Mach-O 路线）与记录文件必须分开走：记录文件在 ~ 下要保持用户属主，不能混进提权批次。
+ */
+function restoreFiles(install: tp.TyporaInstall, machoJobs: tp.CopyJob[], elevate: boolean): void {
+  if (machoJobs.length > 0) tp.installFiles(machoJobs, { elevate });
+  tp.installFiles(
+    [{ from: install.backup, to: install.target }],
+    { elevate: machoJobs.length > 0 ? false : elevate },
+  );
+  try {
+    tp.clearLicense();
+  } catch (err) {
+    // 文件已还原；许可证存储写不动（策略锁定 / 受限环境）不该把整次回滚判成失败——
+    // 如实说明「文件已还原、许可证这一半没做掉」，别让用户以为文件还是坏的。
+    bad(`被改文件已还原，但清空许可证失败（${(err as Error).message}）——请手动确认许可证存储。`);
+  }
 }
 
 async function doRestore(install: tp.TyporaInstall, elevate: boolean): Promise<void> {
@@ -151,10 +154,7 @@ async function doRestore(install: tp.TyporaInstall, elevate: boolean): Promise<v
     tp.kill();
     await new Promise((r) => setTimeout(r, 1500));
   }
-  // 二进制还原与记录还原分开走：记录文件在 ~ 下必须保持用户属主，不能混进提权批次
-  if (machoJobs.length > 0) tp.installFiles(machoJobs, { elevate });
-  if (existsSync(install.backup)) tp.installFiles([{ from: install.backup, to: install.target }], { elevate: false });
-  tp.clearLicense();
+  restoreFiles(install, machoJobs, elevate);
   if (machoJobs.length > 0) {
     const sig = tp.machoInspect(install).signature;
     ok(`已还原二进制与签名：${sig === "developer-id" ? "Developer ID（原始）" : sig}；许可证记录已还原`);
@@ -176,6 +176,7 @@ async function verify(install: tp.TyporaInstall): Promise<Verdict> {
   while (Date.now() - startedAt < VERIFY_TIMEOUT_MS) {
     await new Promise((r) => setTimeout(r, 700));
     const probe = tp.probeActivation(install, startedAt);
+    if (probe.detail) diag(`探针 ${((Date.now() - startedAt) / 1000).toFixed(1)}s：${probe.state} ${probe.detail}`);
     if (probe.state === "activated") return { activated: true, fatal: false, detail: probe.detail };
     if (probe.state === "lost" || probe.state === "gone") {
       return { activated: false, fatal: true, detail: probe.detail };
@@ -206,7 +207,7 @@ async function doHack(
 
   const asarRoute = tp.asarPatchSupported();
   const machoRoute = tp.machoPatchSupported();
-  let backupState: "created" | "refreshed" | "kept";
+  let backupState: AsarBackupState = "kept";
   let machoRollbackJobs: tp.CopyJob[] = [];
 
   if (asarRoute) {
@@ -214,34 +215,35 @@ async function doHack(
 
     // 1. 备份（只定状态，落盘和补丁一起在最后一次性做掉）
     backupState = planAsarBackup(install);
+    diag(`备份状态：${backupState}`);
     // 备份要（重新）建时，它的来源就是当前的 app.asar；否则以已有备份为准
     const source = backupState === "kept" ? install.backup : install.target;
 
-    // 2. 注入（入口名来自包内 package.json 的 main）
-    const entryName = readMain(source);
-    const original = stripPatch(readEntry(source, entryName));
-    if (isPatched(original)) throw new Error("备份里的入口文件已含补丁，请先回滚");
-    const result = inject(entryName, original, loadTemplate(), config);
-    ok(`入口 ${entryName}：原始 ${Buffer.byteLength(original)}B → 注入后 ${result.selfLen}B`);
-
-    // 3. 打包到临时目录 —— 全程在本用户可写的目录里做，不碰安装目录
+    // 2. 注入 + 打包到临时目录 —— 全程在本用户可写的目录里做，不碰安装目录
+    //    （入口名来自包内 package.json 的 main；备份源是「入口已还原」的包，见 asar-stage.ts）
     const work = mkdtempSync(join(tmpdir(), "hapora-"));
+    let staged: Awaited<ReturnType<typeof stageAsarPatch>>;
     try {
-      const staged = join(work, "app.asar");
-      await unpack(source, join(work, "unpacked"));
-      writeFileSync(join(work, "unpacked", entryName), result.patched);
-      await pack(join(work, "unpacked"), staged);
+      staged = await stageAsarPatch({
+        source,
+        work,
+        backupNeeded: backupState !== "kept",
+        template: loadTemplate(),
+        config,
+      });
 
-      // 4. 落盘 —— 唯一需要管理员权限的一步；备份先写、成品后写，一次做完
+      // 3. 落盘 —— 唯一需要管理员权限的一步；备份先写、成品后写，一次做完
       const jobs: tp.CopyJob[] = [];
-      if (backupState !== "kept") jobs.push({ from: install.target, to: install.backup });
-      jobs.push({ from: staged, to: install.target });
+      if (staged.pristine) jobs.push({ from: staged.pristine, to: install.backup });
+      jobs.push({ from: staged.staged, to: install.target });
       tp.installFiles(jobs, { elevate: opts.elevate });
     } finally {
       rmSync(work, { recursive: true, force: true });
     }
+    ok(`入口 ${staged.entryName}：原始 ${staged.originalBytes}B → 注入后 ${staged.selfLen}B`);
+    diag(`入口 ${staged.entryName}；自校验基准 sha256=${staged.selfSha256}；注入后 ${staged.selfLen}B`);
     if (backupState === "created") ok(`已备份原始 app.asar → ${install.backup}`);
-    else if (backupState === "refreshed") ok("检测到 Typora 被重装/升级，已刷新原始备份");
+    else if (backupState === "refreshed") ok("备份不可用或 Typora 被重装/升级，已用原始内容刷新备份");
     else ok("已存在原始备份，跳过备份");
     ok(opts.elevate ? "app.asar 已重新打包，并提权写入安装目录" : "app.asar 已重新打包并写入安装目录");
   } else if (machoRoute) {
@@ -255,8 +257,7 @@ async function doHack(
     }
 
     // 1. 记录备份独立走用户态（~/Library 永远可写，绝不混入二进制的提权批次——混入会被 chown 成 root）
-    backupState = planRecordBackup(install);
-    if (backupState === "created") {
+    if (planRecordBackup(install) === "created") {
       tp.installFiles([{ from: install.target, to: install.backup }], { elevate: false });
       ok(`已备份原始许可证记录 → ${install.backup}`);
     } else {
@@ -267,6 +268,7 @@ async function doHack(
     const macho = tp.machoApplyPatch(install, { elevate: opts.elevate });
     machoRollbackJobs = macho.rollbackJobs;
     ok(`已定位补丁点：${macho.sites.map((s) => `${s.name}（${s.arch} @0x${s.fileOffset.toString(16)}）`).join("、")}`);
+    diag(`补丁点：${macho.sites.map((s) => `${s.name}@${s.arch}:0x${s.fileOffset.toString(16)}`).join("、")}`);
     if (macho.state === "already") {
       ok("二进制已打过补丁，跳过写入（签名校验通过）");
     } else {
@@ -283,67 +285,84 @@ async function doHack(
     return;
   }
 
-  // 5. 许可证（格式由平台实现决定：Windows 写注册表 SLicense/IDate；Linux 写指纹文件 hex；macOS 伪造记录文件）
-  const now = new Date();
-  tp.writeLicense({ email: config.email, licenseCode: config.licenseCode, now });
-  if (!LICENSE_SHAPE.test(config.licenseCode)) {
-    say(`  ! 序列号 ${config.licenseCode} 不匹配 Typora 的 ([A-Z0-9]{6}-){3}[A-Z0-9]{6} 形状，仅作展示用`);
-  }
-  ok(asarRoute ? `许可证已写入${tp.licenseStorageLabel()}` : `许可证记录已伪造 → ${install.target}`);
-
-  // 6. 验收（失败且可归因于本次改动时自动回滚）
-  say();
-  if (!opts.verify) {
-    say("完成。重新打开 Typora 即为已激活状态。");
-    if (asarRoute) {
-      say("跳过验收有风险：若该版本结构与补丁预期不符，Typora 会在启动约 1s 后自行退出。");
-    } else if (machoRoute) {
-      say("跳过验收有风险：若补丁与该版本结构不符，Typora 可能启动失败或激活被撤销。");
-    } else {
-      say("跳过验收有风险：若该版本结构与预期不符，激活会在启动后被 Typora 自行撤销。");
+  // ---- 以下为事务区：写许可证 + 验收，任一步失败（含抛错）都回滚 ----
+  let fatal: string | null = null;
+  try {
+    // 5. 许可证（格式由平台实现决定：Windows 写注册表 SLicense/IDate；Linux 写指纹文件 hex；macOS 伪造记录文件）
+    const now = new Date();
+    tp.writeLicense({ email: config.email, licenseCode: config.licenseCode, now });
+    if (!LICENSE_SHAPE.test(config.licenseCode)) {
+      say(`  ! 序列号 ${config.licenseCode} 不匹配 Typora 的 ([A-Z0-9]{6}-){3}[A-Z0-9]{6} 形状，仅作展示用`);
     }
-    return;
-  }
+    ok(asarRoute ? `许可证已写入${tp.licenseStorageLabel()}` : `许可证记录已伪造 → ${install.target}`);
 
-  say("启动 Typora 验收…");
-  const verdict = await verify(install);
-  if (verdict.activated) {
-    ok(`激活成功：${verdict.detail}`);
-    return;
-  }
-
-  bad(`验收未通过：${verdict.detail}`);
-  if (verdict.fatal) {
-    say("  激活被 Typora 撤销或进程异常，正在回滚到原始状态…");
-    tp.kill();
-    await new Promise((r) => setTimeout(r, 1000));
-    try {
-      // 二进制还原与记录还原分开：记录文件必须保持用户属主，不能混进提权批次
-      if (machoRollbackJobs.length > 0) tp.installFiles(machoRollbackJobs, { elevate: opts.elevate });
-      tp.installFiles([{ from: install.backup, to: install.target }], { elevate: false });
-      tp.clearLicense();
-      ok(
-        machoRollbackJobs.length > 0
-          ? "已回滚：二进制与签名还原为原始 Developer ID 状态，许可证记录已还原"
-          : "已回滚。你的 Typora 回到未激活状态，功能不受影响",
-      );
-    } catch (err) {
-      bad(`回滚失败（${(err as Error).message}），请手动执行：  pnpm hack --restore`);
+    // 6. 验收（失败且可归因于本次改动时自动回滚）
+    say();
+    if (!opts.verify) {
+      say("完成。重新打开 Typora 即为已激活状态。");
+      if (asarRoute) {
+        say("跳过验收有风险：若该版本结构与补丁预期不符，Typora 会在启动约 1s 后自行退出。");
+      } else if (machoRoute) {
+        say("跳过验收有风险：若补丁与该版本结构不符，Typora 可能启动失败或激活被撤销。");
+      } else {
+        say("跳过验收有风险：若该版本结构与预期不符，激活会在启动后被 Typora 自行撤销。");
+      }
+      return;
     }
-    say(`  请把以下信息连同目标文件状态提供给维护者：${verdict.detail}`);
-  } else {
-    say("  未发现可归因的错误，改动已保留。可手动启动 Typora 观察是否正常。");
+
+    say("启动 Typora 验收…");
+    const verdict = await verify(install);
+    if (verdict.activated) {
+      ok(`激活成功：${verdict.detail}`);
+      return;
+    }
+    if (!verdict.fatal) {
+      // 等超时之类环境性失败：改动保留（补丁本身没有暴露出不兼容的证据）
+      bad(`验收未通过：${verdict.detail}`);
+      say("  未发现可归因的错误，改动已保留。可手动启动 Typora 观察是否正常。");
+      process.exitCode = 1;
+      return;
+    }
+    fatal = verdict.detail;
+  } catch (err) {
+    // writeLicense / 验收自身抛错：改动来自本次运行，同样必须回滚
+    fatal = (err as Error).message;
   }
+
+  // ---- 失败出口：一律回滚，绝不留「补丁已生效、许可证缺失」的半成品 ----
+  bad(`未能完成激活：${fatal}`);
+  say("  正在回滚到原始状态…");
+  tp.kill();
+  await new Promise((r) => setTimeout(r, 1000));
+  try {
+    restoreFiles(install, machoRollbackJobs, opts.elevate);
+    ok(
+      machoRollbackJobs.length > 0
+        ? "已回滚：二进制与签名还原为原始 Developer ID 状态，许可证记录已还原"
+        : "已回滚。你的 Typora 回到未激活状态，功能不受影响",
+    );
+  } catch (err) {
+    bad(`回滚失败（${(err as Error).message}），请手动执行：  pnpm hack --restore`);
+  }
+  const signalPath = tp.logPath(install);
+  if (signalPath) diagTail("验收信号文件", signalPath);
+  const debugPath = flushDiagnostics(fatal ?? "未知");
+  say(`  请把以下信息连同目标文件状态提供给维护者：${fatal}`);
+  if (debugPath) say(`  诊断日志（含上述细节与日志末尾片段）：${debugPath}`);
+  else say("  可加 --verbose 重新执行，失败时会生成 hapora-debug.log。");
   process.exitCode = 1;
 }
 
 async function main(): Promise<void> {
   if (has("--help", "-h")) {
-    say("用法：pnpm hack [--dir <Typora安装目录>] [--no-verify] [--restore] [--status] [--yes]");
+    say("用法：pnpm hack [--dir <Typora安装目录>] [--no-verify] [--restore] [--status] [--yes] [--verbose]");
     say("  --dir <路径>  显式指定 Typora 安装根目录（装在非常规位置时使用；也可用环境变量 HAPORA_TYPORA_DIR）");
+    say("  --verbose     收集诊断信息，失败时写到仓库内 hapora-debug.log（默认不写）");
     say("可自定义：仓库根目录 .env 里的 EMAIL / CODE（也可用环境变量覆盖）");
     return;
   }
+
+  if (has("--verbose")) setVerbose(true);
 
   let label: string;
   try {
@@ -361,6 +380,9 @@ async function main(): Promise<void> {
     process.exitCode = 1;
     return;
   }
+
+  diag(`平台 ${label}；安装目录 ${install.dir}；目标 ${install.target}；备份 ${install.backup}`);
+  diag(`配置来源 ${join(repoRoot(), ".env")} 或默认值：邮箱 ${config.email}，序列号 ${config.licenseCode}`);
 
   // --status 只读，不写任何东西，也不需要许可证存储可用
   if (has("--status")) return printStatus(install, config);
@@ -402,5 +424,7 @@ async function main(): Promise<void> {
 
 main().catch((err) => {
   console.error(`失败：${err?.message ?? err}`);
+  const debugPath = flushDiagnostics(err?.message ?? String(err));
+  if (debugPath) console.error(`诊断日志：${debugPath}`);
   process.exitCode = 1;
 });

@@ -327,6 +327,9 @@ export const windowsPlatform: Platform = {
     reg.write("SLicense", "");
   },
 
+  /** 诊断用：验收信号文件（--verbose 失败时取其末尾片段）。 */
+  logPath: () => join(process.env.APPDATA ?? "", "Typora", "typora.log"),
+
   /** 验收探针：读 typora.log 本次启动片段里的关键字（从 hack.ts 的 verify 下沉而来，行为不变）。 */
   probeActivation(_install: TyporaInstall, launchedAtMs: number): { state: ProbeState; detail: string } {
     const START_MARKER = "------------------start------------------";

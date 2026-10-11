@@ -41,6 +41,8 @@ export interface UnixSpec {
   license?: Partial<Pick<Platform, "licenseSupported" | "licenseUnsupportedReason" | "licenseStorageLabel" | "readLicense" | "writeLicense" | "clearLicense">>;
   /** 平台自己的启动验收探针（可选；缺省为恒 pending——由 CLI 的超时兜底） */
   probeActivation?: Platform["probeActivation"];
+  /** 诊断用的验收信号文件（可选；缺省为 null） */
+  logPath?: Platform["logPath"];
 }
 
 /** shell 单引号包裹（内部单引号转义成 '\''）。 */
@@ -192,5 +194,6 @@ export function createUnixPlatform(spec: UnixSpec): Platform {
     }),
 
     probeActivation: probe,
+    logPath: spec.logPath,
   };
 }
