@@ -8,6 +8,7 @@
   var path = require("path");
   var crypto = require("crypto");
   var EventEmitter = require("events").EventEmitter;
+  var G = typeof globalThis !== "undefined" ? globalThis : null;
 
   var APP_DIR = __dirname;
   var MARKER = "__HAPORA_MARKER__";
@@ -78,9 +79,10 @@
    * 启动约 1s 后 Typora 会：读 package.json 取 main → 读 main 指向的本文件 →
    * sha256 → 与随包发布的基准比对，不一致就记录 [LC] 并退出。
    * 两层放行：
-   *   (a) 读取层——凡是读本文件，一律把「随包发布的内容」还回去，校验自然通过，
-   *       而且与校验用什么算法、怎么比对无关；
-   *   (b) 哈希层——万一读取走的是别的通道，就在 digest 上直接返回基准值兜底。
+   *   (a) 读取层——凡是读本文件（readFile* / createReadStream），一律把「随包发布的内容」还回去，
+   *       校验自然通过，而且与校验用什么算法、怎么比对无关；
+   *   (b) 哈希层——万一读取走的是别的通道，就在 digest（createHash / subtle.digest）上
+   *       直接返回基准值兜底；createHash 按**累积内容**判定，分块 update 也认得出自己。
    */
   function normPath(p) {
     try {
@@ -102,6 +104,19 @@
   function pristineAs(opt) {
     var enc = typeof opt === "string" ? opt : (opt && opt.encoding) || null;
     return enc ? pristineBytes().toString(enc) : pristineBytes();
+  }
+  /** 把 string / Buffer / ArrayBuffer / TypedArray 统一成 Buffer（自校验判定用）。 */
+  function asBuffer(d) {
+    try {
+      if (d === null || d === undefined) return null;
+      if (typeof d === "string") return Buffer.from(d, "utf8");
+      if (Buffer.isBuffer(d)) return d;
+      if (typeof ArrayBuffer !== "undefined" && d instanceof ArrayBuffer) return Buffer.from(new Uint8Array(d));
+      if (d && typeof d.byteOffset === "number" && d.buffer) return Buffer.from(d.buffer, d.byteOffset, d.byteLength);
+      return null;
+    } catch (e) {
+      return null;
+    }
   }
 
   var origReadFileSync = fs.readFileSync;
@@ -129,36 +144,92 @@
     };
   }
 
+  /* 流式读取（createReadStream）也要走读取层——否则用流哈希入口文件的版本绕得过放行。 */
+  if (typeof fs.createReadStream === "function") {
+    var origCreateReadStream = fs.createReadStream;
+    fs.createReadStream = function (p, opt) {
+      if (isEntry(p)) {
+        var Readable = require("stream").Readable;
+        var rs = new Readable({ read: function () {} });
+        var enc = typeof opt === "string" ? opt : (opt && opt.encoding) || null;
+        if (enc) rs.setEncoding(enc);
+        process.nextTick(function () {
+          rs.push(pristineBytes());
+          rs.push(null);
+        });
+        return rs;
+      }
+      return origCreateReadStream.apply(this, arguments);
+    };
+  }
+
   function looksLikeSelf(d) {
     try {
-      var len = typeof d === "string" ? Buffer.byteLength(d) : (d && d.length);
-      if (len !== SELF_LEN) return false;
-      if (typeof d === "string") return d.indexOf(PATCH_TAG) >= 0;
-      return Buffer.isBuffer(d) && d.indexOf(PATCH_TAG) >= 0;
+      var b = asBuffer(d);
+      if (!b || b.length !== SELF_LEN) return false;
+      return b.indexOf(PATCH_TAG) >= 0;
     } catch (e) {
       return false;
     }
   }
+  /** 命中自己时该返回的基准哈希（按调用方要的编码现算）。 */
+  function selfDigest(enc) {
+    var b = Buffer.from(SELF_SHA256, "hex");
+    return enc ? b.toString(String(enc)) : b;
+  }
+
   var origCreateHash = crypto.createHash;
   crypto.createHash = function (alg) {
+    var isSha256 = String(alg).toLowerCase() === "sha256";
     var h = origCreateHash.apply(this, arguments);
-    var hit = false;
+    /* 累积缓冲：只看单次 update 的数据，流式分块哈希必然 miss。
+     * 上限就是 SELF_LEN——累积比「自己」更长即已不可能命中，立即放弃缓冲（内存不会无界增长）。 */
+    var acc = isSha256 ? [] : null;
+    var total = 0;
     var ou = h.update, od = h.digest;
-    h.update = function (d) {
+    h.update = function (d, enc) {
       try {
-        if (!hit && String(alg).toLowerCase() === "sha256" && looksLikeSelf(d)) hit = true;
-      } catch (e) { /* 忽略 */ }
+        if (acc) {
+          var plain = !enc || enc === "utf8" || enc === "utf-8" || enc === "latin1" || enc === "binary" || enc === "ascii";
+          var b = plain ? asBuffer(d) : null;
+          if (!b) {
+            acc = null;
+          } else {
+            total += b.length;
+            if (total > SELF_LEN) acc = null;
+            else acc.push(b);
+          }
+        }
+      } catch (e) {
+        acc = null;
+      }
       return ou.apply(this, arguments);
     };
     h.digest = function (enc) {
-      if (hit) {
-        var b = Buffer.from(SELF_SHA256, "hex");
-        return enc ? b.toString(String(enc)) : b;
-      }
+      try {
+        if (acc && looksLikeSelf(Buffer.concat(acc))) return selfDigest(enc);
+      } catch (e) { /* 忽略 */ }
       return od.apply(this, arguments);
     };
     return h;
   };
+
+  /* WebCrypto 的 subtle.digest 是同一条自校验链路的可能通道（同构放行，失败静默降级）。 */
+  try {
+    var subtle = (crypto.webcrypto && crypto.webcrypto.subtle) || crypto.subtle;
+    if (subtle && typeof subtle.digest === "function") {
+      var origSubtleDigest = subtle.digest;
+      subtle.digest = function (alg, data) {
+        try {
+          if (String(alg).toLowerCase().replace(/[^a-z0-9]/g, "") === "sha256" && looksLikeSelf(data)) {
+            var b = Buffer.from(SELF_SHA256, "hex");
+            return Promise.resolve(b.buffer.slice(b.byteOffset, b.byteOffset + b.length));
+          }
+        } catch (e) { /* 忽略 */ }
+        return origSubtleDigest.apply(subtle, arguments);
+      };
+    }
+  } catch (e) { /* subtle 只读等情形：静默降级 */ }
 
   /* ---------- 2. 作废激活校验：劫持 publicDecrypt 的返回值 ----------
    * 许可证密文经 publicDecrypt 解密后即为许可证 JSON。
@@ -177,6 +248,17 @@
   var LICENSE_API = /\/api\/client\//;
   var RELEASE_JSON = /\/releases\/[^?#]*\.json/;
 
+  function releaseJsonBody() {
+    return JSON.stringify({
+      name: "typora",
+      version: appVersion(),
+      releaseNoteLink: "",
+      download: "",
+      downloadCN: "",
+      alternatives: {},
+    });
+  }
+
   function fakeResponse(url, statusCode, body) {
     var Readable = require("stream").Readable;
     var req = new EventEmitter();
@@ -190,6 +272,10 @@
     req.getHeader = function () { return null; };
     req.removeHeader = function () {};
     req.followRedirect = function () {};
+    req.setTimeout = function () { return this; };
+    req.setNoDelay = function () {};
+    req.setSocketKeepAlive = function () {};
+    req.flushHeaders = function () {};
     req.end = function () {
       var self = this;
       process.nextTick(function () {
@@ -210,12 +296,41 @@
     return req;
   }
 
+  /** fetch 用的最小 Response 形态（不依赖全局 Response 存在与否）。 */
+  function fakeFetchResponse(url, body) {
+    return Promise.resolve({
+      ok: true,
+      status: 200,
+      statusText: "OK",
+      url: url,
+      headers: {
+        get: function (n) { return n && String(n).toLowerCase() === "content-type" ? "application/json" : null; },
+      },
+      json: function () { return Promise.resolve(JSON.parse(body)); },
+      text: function () { return Promise.resolve(body); },
+      clone: function () { return this; },
+    });
+  }
+
+  /** 从 string / URL / Request / http 选项对象里取 URL 文本（取不到返回空串）。 */
+  function urlOf(u) {
+    try {
+      if (!u) return "";
+      if (typeof u === "string") return u;
+      if (u.url || u.href) return String(u.url || u.href);
+      if (u.host || u.hostname) return "https://" + (u.host || u.hostname) + (u.path || "");
+      return "";
+    } catch (e) {
+      return "";
+    }
+  }
+
   try {
     var net = require("electron").net;
     if (net && typeof net.request === "function") {
       var origRequest = net.request;
       net.request = function (options) {
-        var url = typeof options === "string" ? options : (options && (options.href || options.url)) || "";
+        var url = urlOf(options);
         if (LICENSE_API.test(url)) {
           /* 续期 / 激活 / 反激活一律返回成功，msg 供下一次解密使用 */
           return fakeResponse(url, 200, JSON.stringify({
@@ -226,18 +341,46 @@
         }
         if (RELEASE_JSON.test(url)) {
           /* 更新检查：回报「当前已是最新」，等价于屏蔽更新 */
-          return fakeResponse(url, 200, JSON.stringify({
-            name: "typora",
-            version: appVersion(),
-            releaseNoteLink: "",
-            download: "",
-            downloadCN: "",
-            alternatives: {},
-          }));
+          return fakeResponse(url, 200, releaseJsonBody());
         }
         return origRequest.apply(net, arguments);
       };
     }
   } catch (e) { /* electron 不可用时静默降级 */ }
+
+  /* 更新检查的通道不止 electron.net：上游若改走 https / http / fetch，放行更新会把
+   * app.asar 整个冲掉（表现为「某天突然回到未激活」）。这里对这三条通道做同一个窄匹配
+   * ——只认 /releases/*.json，其余流量一律透传。 */
+  try {
+    var httpMods = [];
+    try { httpMods.push(require("https")); } catch (e) { /* 无此模块 */ }
+    try { httpMods.push(require("http")); } catch (e) { /* 无此模块 */ }
+    for (var mi = 0; mi < httpMods.length; mi++) {
+      (function (mod) {
+        if (!mod || typeof mod.request !== "function" || mod.__haporaHooked) return;
+        var origModRequest = mod.request;
+        mod.__haporaHooked = true;
+        mod.request = function (options, cb) {
+          if (RELEASE_JSON.test(urlOf(options))) {
+            var req = fakeResponse(urlOf(options), 200, releaseJsonBody());
+            if (typeof cb === "function") req.on("response", cb);
+            return req;
+          }
+          return origModRequest.apply(mod, arguments);
+        };
+      })(httpMods[mi]);
+    }
+  } catch (e) { /* 静默降级 */ }
+
+  try {
+    if (G && typeof G.fetch === "function") {
+      var origFetch = G.fetch;
+      G.fetch = function (input) {
+        var url = urlOf(input);
+        if (RELEASE_JSON.test(url)) return fakeFetchResponse(url, releaseJsonBody());
+        return origFetch.apply(G, arguments);
+      };
+    }
+  } catch (e) { /* 静默降级 */ }
 })();
 /* === end hapora license patch === */

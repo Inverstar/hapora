@@ -64,6 +64,59 @@ export function read(key: string): string | null {
   }
 }
 
+/** 「这一条通道是不是被策略挡住」——EPERM/EACCES（拦截）/ENOENT（程序不在 PATH 上）。 */
+function isChannelBlocked(err: unknown): boolean {
+  const code = (err as NodeJS.ErrnoException)?.code;
+  return code === "EPERM" || code === "EACCES" || code === "ENOENT";
+}
+
+/** PowerShell 单引号包裹（内部单引号翻倍）。 */
+function psQuote(s: string): string {
+  return `'${s.replace(/'/g, "''")}'`;
+}
+
+/**
+ * 回退通道：`reg.exe` 在受限环境（沙箱 / AppLocker / 程序黑名单）下会直接 EPERM，
+ * 此时换 PowerShell 的 `New-ItemProperty` 走同一件事（HKCU 是用户级，不需要提权）。
+ */
+function powershellWrite(key: string, value: string): Error | null {
+  const psPath = psQuote(REG_PATH);
+  const script =
+    `$p = ${psPath}; ` +
+    `if (-not (Test-Path $p)) { New-Item -Path $p -Force | Out-Null }; ` +
+    `New-ItemProperty -Path $p -Name ${psQuote(key)} -Value ${psQuote(value)} -PropertyType String -Force | Out-Null`;
+  try {
+    execFileSync("powershell", ["-NoProfile", "-NonInteractive", "-Command", script], {
+      encoding: "utf-8",
+      windowsHide: true,
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    return null;
+  } catch (err) {
+    return err as Error;
+  }
+}
+
+/** 两条通道都失败时，把「被策略拦截」与「键不可写」分开说，而不是抛裸的 spawnSync 错误。 */
+function writeFailure(key: string, regErr: unknown, psErr: Error): Error {
+  const cause = isChannelBlocked(regErr) && isChannelBlocked(psErr)
+    ? "reg.exe 与 PowerShell 两条通道都被拒绝（多见于沙箱 / AppLocker / 程序黑名单）"
+    : `注册表键不可写（${REG_PATH} 被策略锁定或值被占用）`;
+  const one = (e: unknown): string => String((e as Error)?.message ?? e).split("\n")[0]?.trim() ?? "";
+  return new Error(
+    `写入注册表值 ${key} 失败：${cause}。\n` +
+    `  reg.exe：${one(regErr)}\n` +
+    `  PowerShell：${one(psErr)}`,
+  );
+}
+
 export function write(key: string, value: string, type = "REG_SZ"): void {
-  reg(["add", REG_PATH, "/v", key, "/t", type, "/d", value, "/f"]);
+  try {
+    reg(["add", REG_PATH, "/v", key, "/t", type, "/d", value, "/f"]);
+    return;
+  } catch (regErr) {
+    const psErr = powershellWrite(key, value);
+    if (!psErr) return;
+    throw writeFailure(key, regErr, psErr);
+  }
 }

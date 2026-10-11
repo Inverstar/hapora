@@ -102,8 +102,13 @@ function countBytes(n: number): Buffer {
   return Buffer.concat([Buffer.from([0xf]), Buffer.from([intMarkerFor(w)]), beInt(n, w)]);
 }
 
-/** 序列化为 binary plist。容器（array/dict）的元素是固定宽度的对象表引用，因此先收集对象再统一序列化。 */
-function encodeBplist(root: PLValue): Buffer {
+/**
+ * 序列化为 binary plist。容器（array/dict）的元素是固定宽度的对象表引用，因此先收集对象再统一序列化。
+ *
+ * 导出给测试钉住两条编码硬约束（踩错时 NSKeyedUnarchiver 静默返回 nil、无任何报错）：
+ * int marker 的低 4 位是 log2(字节数)（4 字节是 0x12）；NS.time 必须 real（0x23）编码。
+ */
+export function encodeBplist(root: PLValue): Buffer {
   type Obj =
     | { t: "bool"; v: boolean }
     | { t: "int"; v: number }
@@ -218,7 +223,7 @@ function encodeBplist(root: PLValue): Buffer {
 }
 
 /** 解析 binary plist。支持本文件编码的全部类型；其它 marker 抛错（调用方按「读不到」处理）。 */
-function decodeBplist(buf: Buffer): PLValue {
+export function decodeBplist(buf: Buffer): PLValue {
   if (buf.subarray(0, 8).toString("latin1") !== "bplist00") throw new Error("not a bplist");
   const tail = buf.subarray(buf.length - 32);
   const offsetWidth = tail.readUInt8(6); // trailer：5B unused + sortVersion + offsetSize + refSize + 3×8B
