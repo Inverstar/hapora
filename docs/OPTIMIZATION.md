@@ -4,14 +4,15 @@
 复现路径、修法、验收判据。已完成验收的部分不在此列。
 
 > **状态（2026-10-12，`develop` 分支）**：P1-1、P1-2、P2-1、P2-2、P2-3、P3-1、P3-2、P3-3、
-> P3-4 **均已落地**，`pnpm typecheck` 干净、`pnpm test` 49 项全绿（`node:test`，不需要 Typora）。
-> §5「可选增强」与 §6「明确不做」保持原样（有意不做的部分在 §6 有理由）。
+> P3-4 **均已落地**；§5「可选增强」已收口——`--dry-run` 落地，另两条经复核**不采纳**（理由见 §5）；
+> §6「明确不做」保持不变。`pnpm typecheck` 干净，`pnpm test` 55 项（本地受限环境里 2 项端到端
+> 用例 skip，CI 上全跑）。
 > 真机验收仍按 AGENTS.md 由人在本机执行（Windows/Linux：`pnpm hack --yes` 看日志关键字；
 > macOS：探针 + `lastTry` 金丝雀）——这一条无法自动化，不要假装能。
 
-代码规模参考：`src/` 约 3300 行（其中 `platform/darwin-macho.ts` 611、`hack.ts` 406、
-`platform/darwin-license.ts` 494、`platform/windows.ts` 349、`inject/patch.js` 243）。
-`tsc --noEmit` 当前干净通过，无自动化测试。
+代码规模参考：`src/` 约 3500 行（其中 `platform/darwin-macho.ts` 611、`hack.ts` 约 430、
+`platform/darwin-license.ts` 494、`platform/windows.ts` 349、`inject/patch.js` 300）。
+`pnpm typecheck` / `pnpm test` 均干净通过。
 
 ## 0. 清单总览
 
@@ -27,12 +28,20 @@
 | P3-3 | 失败时无可交付的诊断信息 | `src/hack.ts:333` | 小 | ✅ 已完成（`--verbose`） |
 | P3-4 | README 缺「装了补丁但没激活」排查段 | `README.md` | 小 | ✅ 已完成 |
 
-实施过程中的两个额外发现（不在原清单里，由测试逼出来）：
+实施过程中的三个额外发现（不在原清单里，由测试与参考实现逼出来）：
 
 - **`stripPatch(inject(x)) !== x`**：模板文件末尾自带换行 ⇒ 剥离后原文前面多一个空行。
   在 P1-2 之前它只影响「重建原始内容」的边角路径，P1-2 之后直接影响备份内容（备份里会多一个字节，
   `--restore` 还原出来的入口与随包发布的不一致 ⇒ 自校验基准错位）。已修：`loadTemplate()` 把行尾
   归一成 LF 并去掉末尾换行，`stripPatch()` 容忍 CRLF。测试见 `src/patch.test.ts`。
+- **`pack()` 返回时包其实还没写完**（上游 API 的坑，全套测试约每 3 次复现 1 次）：
+  现象是紧随 `pack()` 的 `readMain()` 抛
+  `Unexpected token '\x00', "\x00\x00…" is not valid JSON`——读到了「大小已到位、内容还是零页」的中间态。
+  根因在 `@electron/asar`：`lib/disk.js` 的 `writeFilesystem` 最后一句是 `return out.end()`，
+  返回的是 `WriteStream` 而不是 promise，所以 `createPackage` 的 promise **在写流关闭之前**就 resolve 了。
+  已修：`src/asar.ts` 的 `pack()` 显式等写流 `close`（带超时兜底），再 `fsync` 一次。
+  这不只是测试稳定性问题：**成品若没写完就被 `installFiles()` 拷进安装目录，用户拿到的是坏包**，
+  而验收会以「自校验失败」收场。
 - **`.gitignore` 补齐**：`hapora-debug.log`（`--verbose` 产物）与 `.workbuddy-ai/`（本地工作区数据）。
 
 ---
@@ -222,7 +231,9 @@ else throw new Error("备份内容为已补丁版本，拒绝继续");
 
 ### 4.1 单元测试（最高优先）
 
-**状态：✅ 已完成**（49 项，`pnpm test`）。落点与建议的表格一一对应：
+**状态：✅ 已完成**（55 项，`pnpm test`）。落点与建议的表格一一对应：
+`src/asar-stage.test.ts`（打包步骤：备份源必须是「入口已还原」的包）、
+`src/hack-dry-run.test.ts`（`--dry-run` 的端到端契约，见 §5）、
 `src/patch.test.ts`（inject / stripPatch / 长度回填 / 基准 sha256 / CRLF 互逆）、
 `src/inject/patch.test.ts`（从 patch.js 源码里抽出 `machineId` / `fingerprint` 跑，
 含「末尾替换不可省」的撞库断言）、`src/backup.test.ts`（备份矩阵，用真实 asar 在临时目录跑）、
@@ -244,6 +255,10 @@ else throw new Error("备份内容为已补丁版本，拒绝继续");
 | `planAsarBackup` / `planRecordBackup` | 见 P1-2 的场景矩阵（首次 / 已补丁 / 升级后） |
 
 运行时建议用 Node 内置 `node:test`，加 `"test": "tsx --test src/**/*.test.ts"` 即可，不引新依赖。
+
+实际落地时改成了**显式列出测试文件**（`tsx --test src/patch.test.ts …`）：`**` 在 Windows 的
+`cmd` 下不会被展开，而 `node --test` 自己的 glob 需要较新的 Node 版本，写死文件名是唯一
+在三个平台、所有 Node ≥ 20 上都确定的行为。新增测试文件时记得同步 `package.json`。
 
 ### 4.2 typecheck 脚本与 CI
 
@@ -280,13 +295,29 @@ plist 的 int marker）目前只在 AGENTS 里。建议在 README 加一个简�
 
 ## 5. 可选增强（非缺陷）
 
-- **`--verify-deep`**：Windows/Linux 的续期链路（1–12 小时窗口）在正常验收时不会被触发，
-  即「此刻激活成功」不等于「续期路径也通」。可加一个测试用标志，通过回拨
-  `IDate` / `lastTry` 强制触发一次续期，把 `electron.net` 的续期接管也纳入验收。
-  代价是验收时间变长，默认关闭。
-- **备份双写**：`app.asar.hapora-orig.bak` 目前与安装目录共存，重装/卸载会一起没掉。
-  可考虑在用户目录再留一份（仅 asar 路线），代价是多一个需要清理的文件。
-- **`--dry-run`**：只打印将要写入的目标与补丁长度，不落盘。对「先看看会不会改错地方」有用。
+**收口结论（2026-10-12）**：一条落地，两条经复核不采纳。
+
+- **`--dry-run`**：**✅ 已完成**。只探测与打包（全程在临时目录），打印将要写入什么——
+  入口名、`原始字节 → 注入后字节`、自校验基准 sha256、备份状态、备份与成品的目标路径、
+  许可证落点，然后退出；不落盘、不写许可证、不启动 Typora，也不结束正在运行的 Typora
+  （因此不需要 `--yes`）。macOS 的 Mach-O 路线做不到「只 stage 不写」（补丁 + 重签是同一次
+  事务），那边退化为只读巡检 + 列出计划。
+  验收：`src/hack-dry-run.test.ts` 在临时目录里伪造一个「Typora 安装」跑真实 CLI，断言
+  退出码 0、`app.asar` 的 sha256 不变、没有生成 `.hapora-orig.bak`、写入探测文件已清理；
+  另一条断言 `--dir` 无效时仍报错退出（不回退自动探测）。受限环境里子进程起不来
+  （实测 `spawnSync node.exe EBUSY`）时该用例**显式 skip** 而不是假装通过，CI 上照常执行。
+- **`--verify-deep`**：**❌ 不采纳——原提议的前提不成立**。原提议假设「续期链路（1–12 小时窗口）
+  在正常验收时不会被触发」，但实测日志序列显示**每次启动都会续期**：
+  `renew` → `[renewLicense]: {…}` → `[L] pass` → `[watch L] hasL: true` →
+  `[renewLicense]: license renewed`（`docs/researches/activation-win.md` §3）。也就是说常规验收的
+  判据里**已经**要求 `[renewLicense]: license renewed`，`electron.net` 的续期接管本来就在覆盖范围内；
+  而「回拨 `IDate` / `lastTry` 强制续期」不会打开任何新路径（客户端没有窗口判断），却会往用户的
+  许可证存储里写一个刻意做旧的日期。1–12 小时说的是**服务端**的宽限，不是客户端的触发条件。
+- **备份双写**：**❌ 不采纳——P1-2 之后已无必要**。原提议担心 `app.asar.hapora-orig.bak` 会随
+  重装/卸载一起消失。P1-2 之后这不是问题：备份缺失时新的备份源是「把当前入口 `stripPatch` 成
+  原始内容再打包」得到的包（`src/asar-stage.ts`，`src/asar-stage.test.ts` 与 `src/backup.test.ts`
+  钉住），即**备份丢了也能自愈**，且产出的备份与随包发布的原始内容逐字节一致。
+  再在用户目录留一份只会多出一个需要清理的残留物。
 
 ---
 

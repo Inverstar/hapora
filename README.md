@@ -31,6 +31,7 @@
 ```bash
 pnpm install            # 国内网络可加 --registry=https://registry.npmmirror.com
 pnpm hack               # 激活（默认会自动验收，失败则回滚）
+pnpm hack --dry-run     # 只探测与打包，打印将要写入什么，一个字节都不写
 pnpm hack --no-verify   # 只打补丁，不启动验收
 pnpm hack --restore     # 回滚到原始状态
 pnpm hack --status      # 只看状态，不改动

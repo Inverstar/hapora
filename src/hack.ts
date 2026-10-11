@@ -25,6 +25,7 @@
  *   --restore    从备份回滚
  *   --status     只打印当前状态
  *   --yes, -y    跳过确认（Typora 正在运行时）
+ *   --dry-run    只探测与打包（临时目录），打印将要写入什么，不落盘、不写许可证、不启动
  *   --verbose    收集诊断信息，失败时写到仓库内 hapora-debug.log（默认不写）
  */
 
@@ -188,12 +189,13 @@ async function verify(install: tp.TyporaInstall): Promise<Verdict> {
 async function doHack(
   install: tp.TyporaInstall,
   config: Config,
-  opts: { verify: boolean; yes: boolean; elevate: boolean },
+  opts: { verify: boolean; yes: boolean; elevate: boolean; dryRun: boolean },
 ): Promise<void> {
-  say("Typora 激活");
+  say(opts.dryRun ? "Typora 激活（dry-run：不写入任何文件）" : "Typora 激活");
   say();
 
-  if (tp.isRunning()) {
+  // dry-run 不碰 Typora：既不结束进程，也不需要 --yes
+  if (!opts.dryRun && tp.isRunning()) {
     if (!opts.yes) {
       say("Typora 正在运行。激活需要重启 Typora 使改动生效，请先关闭它，");
       say("或在确认没有未保存内容后重新执行：  pnpm hack --yes");
@@ -232,6 +234,20 @@ async function doHack(
         config,
       });
 
+      // dry-run：到这里为止（解包 / 注入 / 打包）都只发生在临时目录，可以安全地停在这里
+      if (opts.dryRun) {
+        say("dry-run：已完成探测与打包（全部在临时目录），将要写入的是：");
+        say(`  入口        ${staged.entryName}`);
+        say(`  补丁长度    ${staged.originalBytes}B → ${staged.selfLen}B`);
+        say(`  自校验基准  ${staged.selfSha256}`);
+        say(`  备份状态    ${backupState}`);
+        if (staged.pristine) say(`  备份        ${staged.pristine} → ${install.backup}`);
+        say(`  成品        ${staged.staged} → ${install.target}`);
+        say(`  许可证      ${tp.licenseStorageLabel()}`);
+        say(`  未执行：落盘${opts.elevate ? "（实际执行时需提权写入）" : ""} / 写许可证 / 启动验收`);
+        return;
+      }
+
       // 3. 落盘 —— 唯一需要管理员权限的一步；备份先写、成品后写，一次做完
       const jobs: tp.CopyJob[] = [];
       if (staged.pristine) jobs.push({ from: staged.pristine, to: install.backup });
@@ -253,6 +269,20 @@ async function doHack(
       bad(`许可证记录文件不存在：${install.target}`);
       say("  Typora 至少要完整启动过一次才会生成它。请先启动 Typora 再重新执行。");
       process.exitCode = 1;
+      return;
+    }
+
+    // dry-run：Mach-O 路线的「打包」与落盘是同一次事务（二进制 + 重签无法只 stage 不写），
+    // 因此这里只做只读巡检 + 列出计划，不调用 applyMachOPatch。
+    if (opts.dryRun) {
+      const insp = tp.machoInspect(install);
+      say("dry-run：只读巡检，将要写入的是：");
+      say(`  二进制补丁  ${insp.patched ? "已补丁（renew 短路）" : insp.partial ? "部分补丁（异常）" : "未补丁"}`);
+      say(`  签名        ${insp.signature === "adhoc" ? "ad-hoc（hapora 重签）" : insp.signature === "developer-id" ? "Developer ID（原始）" : "未知"}`);
+      say(`  备份        ${insp.backupDir ?? "（无，执行时会建 <app>.hapora-orig.bak/）"}`);
+      say(`  成品        ${install.exe}（等长 ret 补丁 + ad-hoc 重签）`);
+      say(`  许可证记录  ${install.target}`);
+      say(`  未执行：落盘 / 重签 / 伪造记录 / 启动验收`);
       return;
     }
 
@@ -355,8 +385,9 @@ async function doHack(
 
 async function main(): Promise<void> {
   if (has("--help", "-h")) {
-    say("用法：pnpm hack [--dir <Typora安装目录>] [--no-verify] [--restore] [--status] [--yes] [--verbose]");
+    say("用法：pnpm hack [--dir <Typora安装目录>] [--dry-run] [--no-verify] [--restore] [--status] [--yes] [--verbose]");
     say("  --dir <路径>  显式指定 Typora 安装根目录（装在非常规位置时使用；也可用环境变量 HAPORA_TYPORA_DIR）");
+    say("  --dry-run     只探测与打包（临时目录），打印将要写入什么，不落盘、不写许可证、不启动");
     say("  --verbose     收集诊断信息，失败时写到仓库内 hapora-debug.log（默认不写）");
     say("可自定义：仓库根目录 .env 里的 EMAIL / CODE（也可用环境变量覆盖）");
     return;
@@ -419,7 +450,12 @@ async function main(): Promise<void> {
   }
 
   say(`平台：${label}；邮箱 ${config.email}，序列号 ${config.licenseCode}（来自 ${join(repoRoot(), ".env")} 或默认值）`);
-  return doHack(install, config, { verify: !has("--no-verify"), yes: has("--yes", "-y"), elevate });
+  return doHack(install, config, {
+    verify: !has("--no-verify"),
+    yes: has("--yes", "-y"),
+    elevate,
+    dryRun: has("--dry-run"),
+  });
 }
 
 main().catch((err) => {

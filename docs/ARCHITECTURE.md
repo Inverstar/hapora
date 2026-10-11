@@ -81,7 +81,8 @@ Typora 原生进程（补丁后）
 | `src/platform/linux.ts` | Linux 实现：`which typora` + `/usr/share/typora` 等 + Flatpak/Snap；`pgrep`/`pkill`；`sudo -n` 提权；许可证写 `~/.config/Typora/<指纹>`（hex 编码 JSON，仅 `SLicense` 键）；验收探针读 `~/.config/Typora/typora.log`。 |
 | `src/backup.ts` | 备份规划（纯读盘决策）：备份该新建 / 刷新 / 沿用。含「备份里已是补丁版 ⇒ 视为不可用、刷新」这条判定——它是「`--restore` 假成功」的唯一防线，单独成文件以便单测。 |
 | `src/diag.ts` | `--verbose` 的诊断收集与落盘：默认静默，只在失败路径写仓库根目录的 `hapora-debug.log`。 |
-| `src/asar.ts` | `app.asar` 的解包 / 打包 / 读单文件，以及从包内 `package.json` 读 `main`。 |
+| `src/asar-stage.ts` | asar 路线的打包步骤：解包一次、打两次包——先打「入口已还原成原始内容」的包（备份源），再打注入后的成品。备份源不能裸拷当前 `app.asar`（它可能已含补丁 ⇒ `--restore` 变成假成功），这条契约由单测钉住。 |
+| `src/asar.ts` | `app.asar` 的解包 / 打包 / 读单文件，以及从包内 `package.json` 读 `main`。`pack()` 显式等写流关闭再 `fsync`——`@electron/asar` 的 `createPackage` 不等写流收尾就 resolve（返回的是流而非 promise），不等就会把「大小已到位、内容还是零页」的成品拷进安装目录。 |
 | `src/patch.ts` | 补丁模板的加载与占位符渲染；把补丁注入到入口文件最前面；定义许可证值格式。 |
 | `src/inject/patch.js` | 真正写进 Typora 的代码：自校验放行（读取层 + 哈希层）、许可证接管、续期/更新接管。ES5 语法。 |
 | `src/config.ts` | 邮箱与序列号的可自定义项：默认值、`.env` 解析、来源优先级。 |
