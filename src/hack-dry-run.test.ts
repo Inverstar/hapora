@@ -4,6 +4,11 @@
  * 这一条钉住的是**契约**而不是文案：dry-run 必须在把包解开、注入、重新打包之后停下，
  * 打印将要写入什么，并且**一个字节都不写**（不改 app.asar、不建备份、不写许可证、不启动 Typora）。
  * 同时也验证了「--dir 指向的目录里只要有 resources/app.asar 就能被定位」这条前提。
+ *
+ * 只在**asar 路线（Windows / Linux）**跑：伪造的安装是 `resources/app.asar` 布局，而 macOS 的
+ * `resolve` 只认 `.app` 包（`Info.plist` + `Contents/MacOS/<可执行>`），伪造一个能过
+ * `machoInspect` 的 .app 成本远高于收益——Mach-O 路线的 dry-run 退化成只读巡检，
+ * 按 AGENTS.md 的规矩留真机验证。
  */
 
 import assert from "node:assert/strict";
@@ -63,7 +68,15 @@ function runHack(args: string[]): RunResult {
   };
 }
 
+/** asar 路线（Windows / Linux）才能用下面伪造的安装布局跑端到端。 */
+const ASAR_ROUTE = process.platform === "win32" || process.platform === "linux";
+const NOT_ASAR_ROUTE = "该用例构造的是 asar 路线（Windows/Linux）的安装布局；Mach-O 路线的 dry-run 需要真实 .app 包";
+
 test("--dry-run：打印计划、退出码 0，且不改 app.asar、不建备份", async (t) => {
+  if (!ASAR_ROUTE) {
+    t.skip(NOT_ASAR_ROUTE);
+    return;
+  }
   const dir = mkdtempSync(join(tmpdir(), "hapora-dryrun-"));
   try {
     const { root, asar } = await fakeTyporaInstall(dir);
@@ -91,6 +104,10 @@ test("--dry-run：打印计划、退出码 0，且不改 app.asar、不建备份
 });
 
 test("--dry-run 也遵守「--dir 无效即报错、不回退自动探测」", (t) => {
+  if (!ASAR_ROUTE) {
+    t.skip(NOT_ASAR_ROUTE);
+    return;
+  }
   const dir = mkdtempSync(join(tmpdir(), "hapora-dryrun-bad-"));
   try {
     const { spawned, status, out, spawnError } = runHack(["--dry-run", "--dir", dir]);

@@ -304,8 +304,10 @@ plist 的 int marker）目前只在 AGENTS 里。建议在 README 加一个简�
   事务），那边退化为只读巡检 + 列出计划。
   验收：`src/hack-dry-run.test.ts` 在临时目录里伪造一个「Typora 安装」跑真实 CLI，断言
   退出码 0、`app.asar` 的 sha256 不变、没有生成 `.hapora-orig.bak`、写入探测文件已清理；
-  另一条断言 `--dir` 无效时仍报错退出（不回退自动探测）。受限环境里子进程起不来
-  （实测 `spawnSync node.exe EBUSY`）时该用例**显式 skip** 而不是假装通过，CI 上照常执行。
+  另一条断言 `--dir` 无效时仍报错退出（不回退自动探测）。两种情形下**显式 skip** 而不是假装通过：
+  受限环境里子进程起不来（实测 `spawnSync node.exe EBUSY`），以及**非 asar 路线的平台**
+  （macOS：伪造的是 `resources/app.asar` 布局，而 macOS 的 `resolve` 只认 `.app` 包；
+  Mach-O 路线的 dry-run 是只读巡检，按规矩留真机验证）。CI 的 Windows / Linux 上照常执行。
 - **`--verify-deep`**：**❌ 不采纳——原提议的前提不成立**。原提议假设「续期链路（1–12 小时窗口）
   在正常验收时不会被触发」，但实测日志序列显示**每次启动都会续期**：
   `renew` → `[renewLicense]: {…}` → `[L] pass` → `[watch L] hasL: true` →
