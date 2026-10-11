@@ -17,12 +17,17 @@
 Typora 启动约 1s 后会：读 `<asar>/package.json` 取 `main` → 读该文件 → sha256 → 与内置基准比对，
 不一致就记录 `[LC] Integrity check failed` 并退出。补丁做两件事：
 
-- **(a) 读取层**：包装 `fs.readFileSync` / `fs.readFile` / `fs.promises.readFile`，
+- **(a) 读取层**：包装 `fs.readFileSync` / `fs.readFile` / `fs.promises.readFile` / `fs.createReadStream`，
   当路径规范化后等于 `path.join(__dirname, <入口名>)` 时，返回**随包发布的入口原文**
-  （打包时以 base64 内嵌）。这样无论校验用什么算法、怎么比对，都会算出基准值。
-- **(b) 哈希层**：包装 `crypto.createHash`，当 `sha256` 的 `update()` 实参满足
-  「字节长度等于补丁后入口文件的长度」且「包含补丁标记 `/* === hapora license patch === */`」时，
-  `digest(enc)` 返回随包发布内容的 sha256。
+  （打包时以 base64 内嵌；流式读取返回内容为该原文的 `Readable`）。这样无论校验用什么算法、
+  怎么比对，都会算出基准值。
+- **(b) 哈希层**：包装 `crypto.createHash` 与 `crypto.subtle.digest`。判定按**累积内容**做
+  （不是单次 `update()` 的实参）：把每次 `update()` 的数据追加进内部缓冲，累积长度一旦超过
+  `SELF_LEN` 立即放弃缓冲（内存有界），在 `digest()` 时判断累积内容是否「字节长度等于补丁后入口
+  文件的长度」且「包含补丁标记 `/* === hapora license patch === */`」，命中则返回随包发布内容的 sha256。
+  这样流式分块哈希（`createReadStream` → `hash.update(chunk)`）同样认得出自己。
+- 判定输入统一用 `asBuffer()` 归一（string / Buffer / ArrayBuffer / TypedArray），
+  否则 `subtle.digest('SHA-256', arrayBuffer)` 这类调用永远判不中。
 - 两层各自单独都足以通过校验（已实测），同时保留是为了在未知版本上互相兜底。
 - 其余哈希调用（如机器指纹）必须原样透传。
 
@@ -48,11 +53,20 @@ Typora 启动约 1s 后会：读 `<asar>/package.json` 取 `main` → 读该文�
   `{"success":true,"code":1,"msg":"<base64(许可证标记)>"}`。
 - 其余 URL 原样透传给原实现。
 
-### 4. 更新检查接管
+### 4. 更新检查接管（四条通道）
 
 - 同一个 `net.request` 包装内，URL 命中 `/releases/*.json` 时，返回 body 为
   `{"name":"typora","version":"<当前版本>","releaseNoteLink":"","download":"","downloadCN":"","alternatives":{}}`
   的假响应，使客户端认为已是最新。
+- **通道无关**：更新检查换通道（`https.request` / `http.request` / 全局 `fetch`）时同样拦得住——
+  上游换通道而补丁没跟上，自动更新会覆盖 `app.asar`，表现为「某天突然回到未激活」。
+  - `https.request` / `http.request`：窄匹配 `/releases/*.json`，命中则返回假 `ClientRequest`
+    （带 `on` / `end` / `write` / `abort` / `destroy` / `setTimeout` 等最小面），
+    `http.request(url, cb)` 的 `cb` 注册为 `response` 监听；其余 URL 原样透传。
+  - 全局 `fetch`：命中同样 URL 时返回最小 Response 形态（`ok` / `status` / `headers.get` /
+    `json()` / `text()` / `clone()`），**不依赖全局 `Response` 是否存在**；其余原样透传。
+  - 三条新通道只匹配 `/releases/*.json`（许可证接口仍只由 `electron.net` 接管），
+    其余流量一律透传，避免影响页面与其它网络请求。
 
 ## 输入 / 输出
 
@@ -85,6 +99,10 @@ Typora 启动约 1s 后会：读 `<asar>/package.json` 取 `main` → 读该文�
   整份载荷就会被拒；`email` / `date` / `version` / 许可证号则完全不校验。
 - `native-reg` 不可用 → 回退到 `reg.exe`；两者都失败 → 空串。
 - `electron.net` 不可用 → 静默跳过网络接管（不影响本地激活）。
+- `http` / `https` / 全局 `fetch` 任一不可用 → 该通道静默降级（其余通道照常），
+  且不得因此抛错中断补丁安装。
+- 自校验走 `createReadStream`、分块 `hash.update()` 或 `crypto.subtle.digest` 时同样放行
+  （读取层覆盖到流，哈希层按累积内容判定）。
 - 请求在 `end()` 之前被 `abort()`/`destroy()` → 不发出响应，避免幽灵事件。
 - 入口文件以 URL 对象 / Buffer 形式传给 fs read → 路径匹配按字符串处理，不命中则原样透传。
 - 更新检查拿到的 URL 不属于上述两类（例如 `file://` 资源）→ 原样透传，不能影响页面加载。
@@ -99,6 +117,13 @@ Typora 启动约 1s 后会：读 `<asar>/package.json` 取 `main` → 读该文�
 - [x] 启动后 `checkForUpdates` 不再产生任何更新提示。
 - [x] 主窗口无 `UNREGISTERED` 水印，许可证对话框显示「已使用以下序列号激活」。
 - [x] 在用户持有真实许可证的机器上，`publicDecrypt` 返回真实 JSON 时行为不变（原样放行）。
+- [x] （无需 Typora）`pnpm test` 里的补丁测试全绿：`stripPatch(inject(x)) === x`、
+  长度回填不改变字节数、基准 sha256 等于原文哈希、指纹末尾替换不可省。
+- [ ] **（真机）通道覆盖回归**：把自校验的读取改成 `fs.createReadStream`、或改成
+      `createHash` 分块 `update()` 后重新注入，`typora.log` 仍出现 `[watch L] hasL: true`
+      且不出现 `Integrity check failed`（证明新增的读取层/累积哈希层确实生效）。
+- [ ] **（真机）更新通道回归**：`pnpm hack --yes` 后启动 Typora，检查更新不应提示有新版本
+      （`electron.net` 路径的既有判据不变；新增的 http/https/fetch 通道需要上游换通道时才有机会实测）。
 
 ## 完成定义
 

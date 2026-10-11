@@ -43,6 +43,16 @@ pnpm hack --dir "D:\Software\Typora"   # 装在非常规位置时显式指定安
 
 执行 `pnpm hack` 时若 Typora 正在运行，需要先关闭它，或加 `--yes` 让脚本自行结束进程。
 
+失败时想留下可交付的诊断信息，加 `--verbose`：只在失败路径写 `hapora-debug.log`
+（不入库），里面有安装目录、入口名、自校验基准、备份状态、每次验收探针结果与日志末尾片段。
+
+开发用（不需要 Typora 在场）：
+
+```bash
+pnpm typecheck   # 类型检查
+pnpm test        # 单元测试（node:test）
+```
+
 ### 自定义邮箱与序列号
 
 仓库根目录的 `.env`（不入库，模板见 `.env.example`）：
@@ -57,6 +67,32 @@ CODE=POWER0-ED0000-BY0000-XRL000
 > 序列号与邮箱只写进本地的伪造记录；两个平台在**启动路径**上都不校验它们的内容，
 > 因此这里填什么都能通过——填成自己的信息只是让「我的许可证」对话框看起来顺眼
 > （macOS 上序列号会原样显示在许可证面板）。
+
+## 出问题怎么排查
+
+`pnpm hack` 的失败都会**回滚**（不留「补丁已生效、许可证缺失」的半成品），所以先看它打印到哪一步。
+若结论不明显，按这个最小路径走：
+
+1. `pnpm hack --status`：看三件事——入口是否「已注入补丁」、许可证是否为空、备份是否存在。
+   - 入口「（原始）」+ 许可证「（空）」：当前是干净的未激活状态，直接重跑 `pnpm hack --yes`；
+   - 入口「（已注入补丁）」+ 许可证「（空）」：半成品（早期版本可能出现），先 `pnpm hack --restore` 再重跑；
+   - 备份提示「存的是已补丁版本」：备份不可用，下次 `pnpm hack` 会用剥离补丁后的原始内容自动刷新它。
+2. Windows/Linux 看 `typora.log` 的关键字：
+   - `Integrity check failed`：自校验没放行（补丁与该版本不兼容，正常情况下已自动回滚）；
+   - `onUnfillLicense` / `unfill due to renew fail`：续期被拒；
+   - 只有 `no info` 且 `hasL: false`：多半是许可证**没写进去**（Windows 注册表被策略挡住 /
+     Linux 指纹或编码不对）。这类失败**不报任何错**，是本项目最贵的一类坑。
+3. 加 `--verbose` 重跑：失败时在仓库根目录生成 `hapora-debug.log`（安装目录、入口名、自校验基准、
+   备份状态、每次验收探针结果、日志末尾片段），连同 `--status` 的输出一起提给维护者。
+4. 想回到干净状态：`pnpm hack --restore`（macOS 会把二进制与记录逐字节还原，Developer ID 签名自愈）。
+
+日志路径：Windows `%APPDATA%\Typora\typora.log`；Linux `~/.config/Typora/typora.log`；
+macOS 没有可用日志，看 `--status` 的「许可证状态」与进程是否存活。
+
+三个已知的「静默失效」坑（`AGENTS.md` 有更细的记录）：指纹末尾的 `.replace(/[/=+-]/g, "a")` 不能省
+（否则约一半的机器指纹对不上）；Linux 的许可证文件必须是**整段 JSON 的十六进制**而不是裸 JSON；
+macOS 的 binary plist 里 int marker 低 4 位是 log2(字节数)、`NS.time` 必须 real（踩错时
+`NSKeyedUnarchiver` 静默返回 nil）。
 
 ## 当前状态
 

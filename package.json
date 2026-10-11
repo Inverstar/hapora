@@ -5,7 +5,12 @@
   "description": "Typora 激活机制研究与激活补丁",
   "type": "module",
   "scripts": {
-    "hack": "tsx src/hack.ts"
+    "hack": "tsx src/hack.ts",
+    "typecheck": "tsc --noEmit",
+    "test": "tsx --test src/patch.test.ts src/asar-stage.test.ts src/backup.test.ts src/inject/patch.test.ts src/platform/linux.test.ts src/platform/darwin-license.test.ts src/platform/darwin-macho.test.ts"
+  },
+  "engines": {
+    "node": ">=20"
   },
   "dependencies": {
     "@electron/asar": "^3.2.0"

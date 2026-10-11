@@ -334,3 +334,54 @@ codesign --verify --strict "$APP" && echo OK
   这与 Windows 路线「伪造更新检查使 asar 不被替换」语义等价：**补丁不会被自动更新静默覆盖**；
   手动升级（下载新包覆盖）后二进制换新，重跑 `pnpm hack` 即恢复（备份状态机会识别为 refreshed）。
 - `codesign` / `plutil` / `nm` / `otool` 依赖 Xcode Command Line Tools（`xcode-select --install`）。
+
+## 11. 与独立 PoC 的交叉印证（2026-10-12 复核）
+
+同一机制另有独立复现：`typora-crack`（样本 `1.14.9 / build 7785`，与本仓库的 `1.14.5-dev`、
+Linux 侧 `1.14.9` 不同版本；四个 PoC 覆盖 DYLD 注入 / 伪造记录 / 二进制补丁 / 试用重置）。
+逐条对照后，本仓库的结论与实现均被印证；下列几条值得记下来。
+
+### 11.1 被印证的结论（无改动）
+
+| 结论 | 本仓库（§2–§7） | 独立 PoC |
+|---|---|---|
+| 启动路径不验 RSA，只判「字典里 `email` + `license` 双键非 nil」 | §3 | `readLicenseInfo` 语义一致，且明确「不调用 `verifySig:`」 |
+| 指纹 = `b64(SHA256(IOPlatformUUID))[:10]`，`/ = + -` 逐字符换成 `a` | §2.1 | `fingerPrintNew` 同（实现写作 `"a".join(re.split(r"[/=+\-]", b64))`，等价） |
+| 记录密钥 = `SHA256(uuid + "typora-license")`，无 HMAC、无设备字段绑定 | §2.2 | 同 |
+| 明文是 NSKeyedArchive(NSMutableDictionary) binary plist | §2.3 | 手搓 archive 的对象布局与本文一致（`$null` 在 0、根 dict 在 1） |
+| 改包后必须 ad-hoc 重签，且需追加 `disable-library-validation` | §10.4 | 同：原包三个 entitlements（`allow-dyld-environment-variables` / `allow-jit` / `allow-unsigned-executable-memory`）保留，只追加这一个 |
+| `quickValidateLicense:` 只在手动输码流程，启动路径不经过 | §5、§10.1 | 同（并给出字符集与 checksum 规则，见 §11.3） |
+
+### 11.2 一个必须说清的命名坑：`CCCrypt(iv = NULL)` 是 CBC（零 IV），不是 ECB
+
+独立 PoC 的注释把 `CCCrypt(op, kCCAlgorithmAES, kCCOptionPKCS7Padding, key, 32, /*iv*/ NULL, …)`
+写成「IV = NULL → ECB」，而 **Apple 对 `CCCrypt` 的 `iv` 参数的定义是**：
+
+> If CBC mode is selected (by the absence of any mode bits in the options flags) and no IV is present,
+> a NULL (all zeroes) IV will be used. This is ignored if ECB mode is selected
+> (by the presence of the `kCCOptionECBMode` bit in the options flags).
+
+即：ECB 必须**显式**带上 `kCCOptionECBMode`(0x0002)；只有 `kCCOptionPKCS7Padding`(0x0001) 而 `iv = NULL`
+时仍是 **CBC + 全零 IV**。所以那份 PoC 的**代码**与本仓库实现（`aes-256-cbc` + 16 字节零 IV）
+是同一种调用形态，只是注释用词不准。反过来说：它的 `read_license_dict` 能解开 Typora 自己写的
+真实记录文件，也就**反过来证明 Typora 用的是 CBC + 零 IV**——若真是 ECB，CBC 解密从第二个分组起就是
+乱码，`NSKeyedUnarchiver` 会直接失败。
+
+顺带记一条弱判据的教训：§8 第 3 条只 `head -c 8` 看 `bplist00`。**首个分组在两种模式下完全一样**
+（`C₁ = E(P₁ ⊕ 0) = E(P₁)`），这个检查根本区分不了 CBC 与 ECB。要真正区分，必须比对**第二个分组之后**
+的字节，或直接按 §8 的 `openssl` 命令解出完整 plist 再交给 `NSKeyedUnarchiver`（§2.3 的判据）。
+
+### 11.3 已知但**不采纳**的两点
+
+- **补丁点选 `hasLicense` / `cannotContonueUse:`**（PoC 3）：把「是否已授权」直接改成恒 YES，
+  比补 `renew` 更强（记录即使被清掉也照样放行）。不采纳的原因有二：
+  ① 它是「按原字节特征码定位」（`ARM_HAS_ORIG` 等常量，绑定 1.14.9 这一个包），
+     与本仓库「运行时解析符号表、零硬编码偏移」的规则（ADR-012 / AGENTS.md）直接冲突；
+  ② 本仓库的语义目标是「一次激活、永久有效」，`renew` 短路 + 伪造记录已达成，
+     换成恒返回 YES 会额外改变运行时的功能判定语义，收益不抵风险。若上游改结构导致 `renew`
+     定位失败，这里按「显式失败」处理（宁失败不猜），而不是退化成特征码硬补。
+- **序列号 checksum 校验**（`scripts/license_format.py`）：字符集 `L23456789ABCDEFGHJKMNPQRSTUVWXYZ`
+  （去掉 `0/1/I/O`），去 `-` 后 24 字符，末尾 2 字符是前 16 字符奇偶位之和的模字符。本仓库不实现：
+  它只影响「手动输码」这条我们不走的路（伪造记录不经过 `quickValidateLicense:`），
+  实现它只会让 `.env` 里自造的序列号多出一条警告噪音。`src/config.ts` 的 `LICENSE_SHAPE`
+  仍然只做形状提示。

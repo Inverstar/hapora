@@ -1,0 +1,35 @@
+name: CI
+
+# 只跑「Typora 不在场也能跑」的那部分：类型检查 + 单元测试。
+# 真机验收（启动 Typora 读日志关键字 / 轮询许可证记录）无法自动化，
+# 按 AGENTS.md 的要求由人在本机执行 pnpm hack --yes。
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+
+jobs:
+  check:
+    name: typecheck + test（${{ matrix.os }}）
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: pnpm
+
+      # --ignore-scripts：仓库已知的 esbuild postinstall 问题（见 docs/DECISIONS.md 与 AGENTS.md 的环境说明）
+      - run: pnpm install --ignore-scripts
+      - run: pnpm typecheck
+      - run: pnpm test

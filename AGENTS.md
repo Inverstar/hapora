@@ -86,7 +86,10 @@ Linux（Ubuntu 26.04 / Typora 1.14.9，WSL2）均有真机验收，Fedora / Arch
     猜错会产出「改了却没激活」且无任何报错的状态。宁可在改动文件之前退出。
   - `sudo` 只允许用 `-n`（非交互），绝不能出现会等待输入密码的形式（会挂住 CLI）。
   - 被改对象必须先备份再改写；任何时候都要保证 `--restore` 可用。
-  - 修改补丁 / 伪造逻辑后必须跑一次 `pnpm hack --yes` 验收：
+  - 改完先跑 `pnpm typecheck` 与 `pnpm test`（`node:test`，不需要 Typora，覆盖指纹公式、
+    注入/剥离互逆、许可证编解码、Mach-O 解析、备份规划矩阵）；CI（`.github/workflows/ci.yml`）
+    在三个平台各跑一遍这两条。
+  - 修改补丁 / 伪造逻辑后必须跑一次 `pnpm hack --yes` 验收（自动化测不了，别假装能）：
     Windows / Linux（asar 路线）的判据是日志中同时满足 `[watch L] hasL: true`、`[renewLicense]: license renewed`，
     且启动 1s 后**没有** `Integrity check failed`、没有 `onUnfillLicense`、进程不退出
     （日志路径：Windows `%APPDATA%\Typora\typora.log`，Linux `~/.config/Typora/typora.log`）；
@@ -105,14 +108,20 @@ Linux（Ubuntu 26.04 / Typora 1.14.9，WSL2）均有真机验收，Fedora / Arch
   `unix.ts`（Unix 公共部分）、`windows.ts` / `darwin.ts` / `linux.ts`（各平台实现）、
   `darwin-license.ts`（macOS 许可证记录文件的编解码与伪造）、`darwin-macho.ts`
   （Mach-O 解析 / ret 补丁 / entitlements 与重签 / 备份事务，darwin 私有）。
-- `src/patch.ts` — 补丁模板的加载、占位符渲染、注入与剥除；Windows 许可证值的格式定义。
+- `src/backup.ts` — 备份规划（新建 / 刷新 / 沿用；「备份里已是补丁版 ⇒ 刷新」在此）。
+- `src/diag.ts` — `--verbose` 的诊断收集与落盘（`hapora-debug.log`，只在失败路径写）。
+- `src/patch.ts` — 补丁模板的加载（行尾归一）、占位符渲染、注入与剥除；Windows 许可证值的格式定义。
 - `src/inject/patch.js` — 真正被注入到 Typora 入口文件的代码（仅 asar 路线）。
 - `src/config.ts` — 邮箱 / 序列号的可自定义项，来源优先级与默认值。
 - `src/asar.ts` — `app.asar` 解包 / 打包 / 读单文件 / 读 `main`（仅 asar 路线）。
-- `src/registry.ts` — `HKCU\SOFTWARE\Typora` 读写 + 通用只读查询（仅 Windows 实现使用）。
+- `src/registry.ts` — `HKCU\SOFTWARE\Typora` 读写（`reg.exe`，回退 PowerShell）+ 通用只读查询
+  （仅 Windows 实现使用）。
+- `src/**/*.test.ts` — 单元测试（`node:test`，不需要 Typora）：`pnpm test` / `pnpm typecheck`。
+- `.github/workflows/ci.yml` — 三平台跑 typecheck + test（真机验收不在 CI 内）。
 - `.env.example` — 可自定义项的模板（`.env` 本身不入库）。
 - `docs/researches/activation-win.md` — Windows（Electron）机制研究报告。
 - `docs/researches/activation-mac.md` — macOS（原生）机制研究报告。
 - `docs/researches/activation-linux.md` — Linux（Electron）机制研究报告。
 - `docs/PRD.md` / `docs/ARCHITECTURE.md` / `docs/DECISIONS.md` — 产品目标、结构、决策记录。
+- `docs/OPTIMIZATION.md` — 评审得出的待办清单（P1/P2/P3，含代码位置与验收判据）。
 - `docs/specs/` — 各模块的行为规格（含可复现的验收判据）。

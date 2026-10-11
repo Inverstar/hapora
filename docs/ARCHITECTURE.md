@@ -52,8 +52,9 @@ Typora 主进程
        └─ require(... .jsc) ← 字节码
             └─ 读许可证存储 → 解密许可证 → 续期 → 渲染进程
                  ▲            ▲            ▲
-   fs.* / crypto.createHash   publicDecrypt   electron.net.request
-   （自校验放行，双层）        （许可证接管）   （续期 / 更新接管）
+   fs.* / createReadStream     publicDecrypt   electron.net.request
+   crypto.createHash / subtle                  https|http.request / fetch
+   （自校验放行，双层）        （许可证接管）   （续期 / 更新接管，通道无关）
 
 [Mach-O 路线 · macOS]
 Typora 原生进程（补丁后）
@@ -78,11 +79,13 @@ Typora 原生进程（补丁后）
 | `src/platform/darwin-license.ts` | macOS 许可证记录文件的编解码与伪造：binary plist 最小编解码器、keyed archive 组装、AES 加解密、指纹/密钥派生、伪造配方（lastTry 金丝雀）。 |
 | `src/platform/darwin-macho.ts` | macOS Mach-O 补丁：fat/符号表解析与补丁点定位（零硬编码偏移）、ret 补丁生成、entitlements 导出注入、codesign 重签封装、包外备份与事务化落地（状态机 + 失败紧急还原）。 |
 | `src/platform/linux.ts` | Linux 实现：`which typora` + `/usr/share/typora` 等 + Flatpak/Snap；`pgrep`/`pkill`；`sudo -n` 提权；许可证写 `~/.config/Typora/<指纹>`（hex 编码 JSON，仅 `SLicense` 键）；验收探针读 `~/.config/Typora/typora.log`。 |
+| `src/backup.ts` | 备份规划（纯读盘决策）：备份该新建 / 刷新 / 沿用。含「备份里已是补丁版 ⇒ 视为不可用、刷新」这条判定——它是「`--restore` 假成功」的唯一防线，单独成文件以便单测。 |
+| `src/diag.ts` | `--verbose` 的诊断收集与落盘：默认静默，只在失败路径写仓库根目录的 `hapora-debug.log`。 |
 | `src/asar.ts` | `app.asar` 的解包 / 打包 / 读单文件，以及从包内 `package.json` 读 `main`。 |
 | `src/patch.ts` | 补丁模板的加载与占位符渲染；把补丁注入到入口文件最前面；定义许可证值格式。 |
 | `src/inject/patch.js` | 真正写进 Typora 的代码：自校验放行（读取层 + 哈希层）、许可证接管、续期/更新接管。ES5 语法。 |
 | `src/config.ts` | 邮箱与序列号的可自定义项：默认值、`.env` 解析、来源优先级。 |
-| `src/registry.ts` | `HKCU\SOFTWARE\Typora` 的读写，以及两个通用只读查询（`queryValue` / `queryTree`）。仅被 Windows 平台实现使用。 |
+| `src/registry.ts` | `HKCU\SOFTWARE\Typora` 的读写，以及两个通用只读查询（`queryValue` / `queryTree`）。写入走 `reg.exe`，被策略挡住时回退 PowerShell 的 `New-ItemProperty`；两条都失败时给出区分「通道被拦」与「键不可写」的错误。仅被 Windows 平台实现使用。 |
 
 ## 模块关系
 
@@ -105,9 +108,13 @@ Typora 原生进程（补丁后）
 3. **算自校验量**：对入口原文算 `sha256`，并把原文本身编成 base64 备用。
 4. **渲染并注入**：替换占位符，插到入口文件 `"use strict"` 之后的**最前面**；
    量出注入后的字节长度，回填到定宽的 8 位长度占位符（回填不改变文件长度）。
-5. **打包**：解包整个 asar 到用户临时目录 → 写入新的入口文件 → 重新打包成一份成品 `app.asar`（仍在临时目录里）。
+5. **打包**：解包整个 asar 到用户临时目录（只解一次）→ 先把入口写回**原始内容**并打一份
+   `pristine.asar`（备份源），再把入口换成注入后的内容打成成品 `app.asar`（都在临时目录里）。
+   备份源必须是「入口已还原」的包：裸拷当前 `app.asar` 会在「备份缺失 + 当前已补丁」时
+   把补丁版存成备份，`--restore` 就成了假成功。
 6. **落盘**：`installFiles()` 把「备份（如需）」与「成品」写进安装目录。目录可写就直接复制；
    不可写就只对这一步做一次平台提权（Windows 一次 UAC / Unix `sudo -n`）批量完成这两次复制。
+   落盘之后进入**事务区**：写许可证与验收期间的任何失败都回滚（还原备份 + 清许可证）。
 7. **写许可证**：
    - Windows：`SLicense = base64("@@HAPORA_LICENSE@@") + "#0#" + M/D/YYYY`、`IDate = M/D/YYYY`（注册表，用户级，无需提权）；
    - macOS（Mach-O 路线的第 2 步在 `darwin-macho.ts` 内事务化完成）：解析符号表定位
@@ -133,7 +140,7 @@ Typora 原生进程（补丁后）
 | Typora 安装目录（asar 路线） | 直接改文件 | 仅 Windows/Linux：`app.asar` 被整体替换，原始文件留在同目录的 `.hapora-orig.bak`；目录不可写时这一步需要一次平台提权 |
 | Typora .app 包（Mach-O 路线） | 直接改文件 + `codesign` | 仅 macOS：`Contents/MacOS/<可执行>` 被 ret 补丁后覆盖、包被 ad-hoc 重签；原始二进制 + `CodeResources` + entitlements 备份到**包外** `<.app>.hapora-orig.bak/`；`--restore` 逐字节拷回即恢复 Developer ID 原始签名（自愈，无需再签）。首次改包会触发一次 TCC「App Management」弹窗 |
 | 许可证记录文件（Mach-O 路线） | 直接改文件 | 仅 macOS：`~/Library/Application Support/<bundle id>/.<指纹>` 被替换为伪造记录，原始文件备份为同名的 `.hapora-orig.bak`；用户目录恒可写，**永远走用户态**（不混入二进制的提权批次） |
-| 许可证存储 | Windows：`reg.exe`；macOS：`codesign`/`plutil`/`ioreg` 等外部命令；Linux：Node fs（hex 编码 JSON） | Windows 写 `HKCU\SOFTWARE\Typora` 的 `SLicense`/`IDate`；macOS 的记录加解密由 Node 内置 `crypto` 完成，Mach-O 路线用 `codesign` 重签/验签、`plutil` lint；Linux 写 `~/.config/Typora/<指纹>`（hex 编码，仅 `SLicense`） |
+| 许可证存储 | Windows：`reg.exe`（回退 PowerShell）；macOS：`codesign`/`plutil`/`ioreg` 等外部命令；Linux：Node fs（hex 编码 JSON） | Windows 写 `HKCU\SOFTWARE\Typora` 的 `SLicense`/`IDate`；macOS 的记录加解密由 Node 内置 `crypto` 完成，Mach-O 路线用 `codesign` 重签/验签、`plutil` lint；Linux 写 `~/.config/Typora/<指纹>`（hex 编码，仅 `SLicense`） |
 | Typora 自身日志 | Windows/Linux 只读 | asar 路线的验收读 `typora.log`（Windows: `%APPDATA%\Typora\`；Linux: `~/.config/Typora/`）；macOS 无日志可用，改读记录文件状态 |
 | 网络 | **不交互** | asar 路线在进程内截断请求；Mach-O 路线让 `renew` 根本不运行——本工具自身不发起任何网络请求 |
 
@@ -145,9 +152,16 @@ Typora 原生进程（补丁后）
   两边必须用同一个来源。
 - **自校验基准天然对齐**：基准就是「该版本随包发布的入口内容」的哈希，补丁在打包时按实际内容现算，
   所以不需要知道基准常量是什么。
-- **自校验放行是双层的**：读取层（`fs.readFileSync` / `fs.readFile` / `fs.promises.readFile` 命中入口路径时
-  返回原文）与哈希层（`crypto.createHash` 命中自己时返回基准哈希）。实测两层各自单独都足以通过校验，
-  同时保留是为了在未知版本上互为兜底。
+- **注入与剥离必须严格互逆**：`stripPatch(inject(x)) === x`。模板在加载时把行尾归一成 LF 并去掉
+  末尾换行，剥离时容忍 CRLF——否则剥离出来的「原始入口」会比重建前多一两个字节，
+  备份内容与自校验基准跟着一起错位。`pnpm test` 钉住了这条性质。
+- **自校验放行是双层的**：读取层（`fs.readFileSync` / `fs.readFile` / `fs.promises.readFile` /
+  `fs.createReadStream` 命中入口路径时返回原文）与哈希层（`crypto.createHash` 按**累积内容**判定、
+  `crypto.subtle.digest` 同构放行，命中自己时返回基准哈希）。实测两层各自单独都足以通过校验，
+  同时保留是为了在未知版本上互为兜底；累积判定是为了流式分块哈希不再 miss。
+- **更新拦截是通道无关的**：`electron.net.request` 之外，`https.request` / `http.request` / 全局 `fetch`
+  对 `/releases/*.json` 做同一个窄匹配（其余流量一律透传）。上游换通道而补丁没跟上，
+  自动更新会覆盖 `app.asar`，表现为「某天突然回到未激活」。
 - **伪造的 HTTP 响应必须是 `Readable`**：Typora 经 `electron-fetch` 发请求，内部执行 `res.pipe(...)`，
   只实现 `EventEmitter` 会在构造 `Response` 时抛错。
 - **ES5 语法约束**：注入代码运行在 Typora 的模块作用域，不保证跑在支持新语法的构建配置下，
@@ -181,4 +195,7 @@ Typora 原生进程（补丁后）
   踩错时 `NSKeyedUnarchiver` **静默返回 nil**（现象是「伪造被无视、状态未激活」且无任何报错），
   验证必须以 `NSKeyedUnarchiver` 为准而非 `plistlib`。见研究报告 §2.3。
 - **失败要响且要可逆**：补丁自检（占位符数量、长度回填、入口存在）任何一项不满足都直接抛错；
-  启动验收把「不兼容」翻译成一次自动回滚，而不是留下一个启动即退的坏包（或一份被清掉的伪造记录）。
+  落盘之后的整段（写许可证 + 启动验收）是一个事务——写许可证失败、验收判「可归因失败」、
+  或期间任何一步抛错，都回滚到原始状态，而不是留下一个启动即退的坏包
+  （或「补丁在、许可证没了」的半成品，或一份被清掉的伪造记录）。等超时这类不可归因的失败
+  仍保留改动并提示——没有证据表明补丁不兼容。

@@ -55,6 +55,9 @@ macOS 没有可用的验收日志：既不存在 `typora.log`，unified log 在�
 - `probeActivation(install, launchedAtMs)`：验收探针，返回
   `activated | lost | gone | pending`。Windows/Linux 读日志关键字（`lost` 携日志路径）；
   macOS 解密记录文件判 `email`/`license` 键是否仍在（`lost` 即发生了 unfill），并查进程存活。
+- `logPath(install)`（可选能力位）：诊断用的验收信号文件——Windows `%APPDATA%\Typora\typora.log`、
+  Linux `~/.config/Typora/typora.log`；macOS 无可用日志，不提供（返回 null）。仅 `--verbose`
+  的失败路径会读它的末尾片段。
 
 ## 约束
 
