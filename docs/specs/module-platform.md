@@ -45,7 +45,10 @@ macOS 没有可用的验收日志：既不存在 `typora.log`，unified log 在�
   改动前导出 entitlements → 临时目录 stage → 一次性落盘（备份先于覆盖；安装后恢复执行位；
   root 属主时 chown 归还）→ ad-hoc 重签 → **对重签后的磁盘文件重新解析复检**；
   写盘后任一步失败从备份紧急还原并重抛。
-- `writeLicense({ email, licenseCode, now })`：Windows 写注册表；macOS 生成并加密写入伪造记录
+- `writeLicense({ email, licenseCode, now })`：Windows 写注册表（`reg.exe`；失败则回退到
+  `powershell -NoProfile -NonInteractive` 的 `New-ItemProperty`，两条通道都失败时抛出的错误要区分
+  「被策略拦截（沙箱 / AppLocker / 程序黑名单）」与「注册表键不可写」，并附两条通道的首行报错）；
+  macOS 生成并加密写入伪造记录
   （`lastTry = now − LAST_TRY_HOURS_AGO(48h)` 金丝雀，窗口外）；Linux 写 `~/.config/Typora/<指纹>`
   （hex 编码 JSON，`SLicense = base64(marker)#0#M/D/YYYY`）。
 - `clearLicense()`：清空许可证。macOS 是 no-op（伪造与备份是同一个文件，`--restore` 的备份还原

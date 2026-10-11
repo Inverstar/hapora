@@ -86,6 +86,12 @@ Linux（Ubuntu 26.04 / Typora 1.14.9，WSL2）均有真机验收，Fedora / Arch
     猜错会产出「改了却没激活」且无任何报错的状态。宁可在改动文件之前退出。
   - `sudo` 只允许用 `-n`（非交互），绝不能出现会等待输入密码的形式（会挂住 CLI）。
   - 被改对象必须先备份再改写；任何时候都要保证 `--restore` 可用。
+  - **备份源必须是「入口已还原成原始内容」的包**（`src/asar-stage.ts`），不能裸拷当前 `app.asar`——
+    当前包可能已含补丁，裸拷会让 `--restore` 变成「报成功但状态没变」。
+  - **打包只能走 `src/asar.ts` 的 `pack()`**：`@electron/asar` 的 `createPackage` 不等写流收尾就
+    resolve（`lib/disk.js` 的 `writeFilesystem` 返回的是 `WriteStream` 而非 promise），绕过它直接调用
+    会读到「大小已到位、内容零页」的半成品（约每 3 次复现 1 次），生产里表现为**把没写完的成品
+    拷进安装目录**。`pack()` 已代为等 `close` + `fsync`。
   - 改完先跑 `pnpm typecheck` 与 `pnpm test`（`node:test`，不需要 Typora，覆盖指纹公式、
     注入/剥离互逆、许可证编解码、Mach-O 解析、备份规划矩阵）；CI（`.github/workflows/ci.yml`）
     在三个平台各跑一遍这两条。
@@ -109,6 +115,8 @@ Linux（Ubuntu 26.04 / Typora 1.14.9，WSL2）均有真机验收，Fedora / Arch
   `darwin-license.ts`（macOS 许可证记录文件的编解码与伪造）、`darwin-macho.ts`
   （Mach-O 解析 / ret 补丁 / entitlements 与重签 / 备份事务，darwin 私有）。
 - `src/backup.ts` — 备份规划（新建 / 刷新 / 沿用；「备份里已是补丁版 ⇒ 刷新」在此）。
+- `src/asar-stage.ts` — asar 路线的打包步骤：解一次包、打两次包（先打「入口已还原」的备份源，
+  再打注入后的成品）；入口名仍来自包内 `package.json` 的 `main`。
 - `src/diag.ts` — `--verbose` 的诊断收集与落盘（`hapora-debug.log`，只在失败路径写）。
 - `src/patch.ts` — 补丁模板的加载（行尾归一）、占位符渲染、注入与剥除；Windows 许可证值的格式定义。
 - `src/inject/patch.js` — 真正被注入到 Typora 入口文件的代码（仅 asar 路线）。
